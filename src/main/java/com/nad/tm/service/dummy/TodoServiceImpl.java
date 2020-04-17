@@ -6,6 +6,8 @@ import java.util.List;
 import com.nad.tm.api.dummy.TodoService;
 
 //SUT
+//This is client of TodoService API. Just think like that.
+//it's confusing to name the class like below
 public class TodoServiceImpl {
 
 	//Dependency
@@ -15,11 +17,11 @@ public class TodoServiceImpl {
 		this.todoService = todoService;
 	}
 	
-	public List<String> filterTodos(String user) {
+	public List<String> filterTodos(String searchTerm) {
 		List<String> fileredList = new ArrayList<String>();
-		List<String> todoList = todoService.findTodos(user);
+		List<String> todoList = todoService.findTodos(searchTerm);
 		for(String todo : todoList) {
-			if(todo.contains("Spring"))
+			if(todo.contains(searchTerm))
 				fileredList.add(todo);
 		}
 		return fileredList;

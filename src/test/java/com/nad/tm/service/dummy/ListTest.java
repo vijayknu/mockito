@@ -1,6 +1,10 @@
 package com.nad.tm.service.dummy;
 
+import static org.hamcrest.CoreMatchers.is;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThat;
+import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.when;
 
 import java.util.List;
 
@@ -31,6 +35,19 @@ public class ListTest {
 		Mockito.when(listMock.get(Mockito.anyInt())).thenReturn("One");
 		assertEquals("One", listMock.get(0));
 		assertEquals("One", listMock.get(1));
+	}
+	
+	@Test
+	public void testGetUsingBDD() {
+		//Given
+		List<String> listMock = Mockito.mock(List.class);
+		given(listMock.get(Mockito.anyInt())).willReturn("One");
+		
+		//When
+		String value = listMock.get(0);
+		
+		//Then
+		assertThat(value, is("One"));
 	}
 
 	@Test(expected = RuntimeException.class)
