@@ -17,14 +17,23 @@ public class TodoServiceImpl {
 		this.todoService = todoService;
 	}
 	
-	public List<String> filterTodos(String searchTerm) {
+	public List<String> filterTodos(String user) {
 		List<String> fileredList = new ArrayList<String>();
-		List<String> todoList = todoService.findTodos(searchTerm);
+		List<String> todoList = todoService.findTodos(user);
 		for(String todo : todoList) {
-			if(todo.contains(searchTerm))
+			if(todo.contains("Spring"))
 				fileredList.add(todo);
 		}
 		return fileredList;
+	}
+	
+	public void deleteTodosOtherThanSpring(String user){
+		List<String> todoList = todoService.findTodos(user);
+		for(String todo : todoList) {
+			if(!todo.contains("Spring")) {
+				todoService.deleteTodos(todo);
+			}
+		}
 	}
 
 }
