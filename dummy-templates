@@ -1,0 +1,389 @@
+pipeline {
+    agent {
+        label 'docker'
+    }
+
+    environment {
+        AWS_SHARED_CREDENTIALS_FILE = "${env.WORKSPACE}/awsconfig"
+        BASE_AMI_URL = 'http://build.oneplatform.build/job/ami-base/lastSuccessfulBuild/artifact/AMI-base.us-west-2.json'
+        AWS_DEFAULT_REGION  = "us-west-2"
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20', daysToKeepStr: '90'))
+        disableConcurrentBuilds()
+        timestamps()
+    }
+    triggers {
+        pollSCM('')     // allows build to be triggered by BitBucket Webhook
+    }
+    parameters {
+        booleanParam (name: 'build_only', defaultValue: false, description: '', )
+        string (name: 'region', defaultValue: 'us-west-2', description: 'AWS Region')
+    }
+
+    stages {
+        stage('Setup Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        // checkout application code and common tools
+        stage("Checkout") {
+            steps {
+                dir("application") {
+                    git(url: env.GIT_URL, branch: env.GIT_BRANCH, credentialsId: "git-techm-io-tk")
+                    script {
+                        git_rev_count = sh(script: "git rev-list --all --count", returnStdout: true).trim()
+                    }
+                }
+                dir("buildtools") {
+                    git(url: 'https://git.techm.io/scm/ccdev/cc-devops-buildtools.git', branch: "master", credentialsId: "git-techm-io-tk")
+                }
+            }
+        }
+
+        // read all properties from top level setting file
+        stage("Setup Project Properties") {
+            steps {
+                script {
+                    project_setting_file = "${WORKSPACE}/application/project_setting.yml"
+                    build_settings_file ="${WORKSPACE}/application/build_setting.yml"
+                    sh("${env.WORKSPACE}/buildtools/tools/create_build_setting.py -f ${project_setting_file} -e dev -r ${AWS_DEFAULT_REGION} -b ${GIT_BRANCH}")
+                    sh("cat ${build_settings_file}")
+                    def props = readYaml file: build_settings_file
+                    app_name = props.config.app_name
+                    app_family = props.config.app_family
+                    account_name = props.config.account_name
+                    jenkins_status_email = props.config.jenkins_status_email
+                    region = props.config.region
+                    deploy_target = props.config.deploy_target
+                    // use git rev count to get full version number
+                    version = props.config.version.toString()
+                    if(env.GIT_BRANCH != "master") { version = '0.0' }
+                    full_version = version + "." + git_rev_count
+                    println("""
+                        app_name = ${app_name}
+                        app_family = ${app_family}
+                        version = ${full_version}
+                        deploy_target = ${deploy_target}
+                        account_name = ${account_name}
+                    """)
+
+                    service_path  = props.config.service_path
+                    // docker setting
+                    tools_docker_repo = props.config.tools_docker_repo
+                    tools_docker_uri = props.config.tools_docker_uri
+                    ami_share_accounts = props.config.account_number
+                }
+            }
+        }
+
+        
+
+        // get latest base ami
+        stage ("Build Application") {
+            steps {
+                script {
+                   dir("application") {
+                        println("commit_id=${git_commit}")
+                        sh("chmod +x gradlew ")
+                        sh("./gradlew clean build buildrpm -Papp_version=${full_version} -Pgit_info='${git_url},${git_commit}'")
+                    }
+                }
+            }
+        }
+
+         // publish contaier to registry
+        stage("Publish RPM") {
+            steps {
+                script {
+                    def artifactory_server = Artifactory.server('Artifactory')
+                    def artifact_spec = """
+                    {
+                        "files" : [{
+                                "pattern" : "application/build/distributions/(*).rpm",
+                                "target" : "cc-rpm-local/${app_family}/${app_name}/${full_version}/{1}.rpm",
+                                "props" : "git_url=${GIT_URL};git_branch=${GIT_BRANCH};git_commit=${GIT_COMMIT}"
+                        }]
+                    }
+                    """
+
+                    def artifactinfo = artifactory_server.upload(artifact_spec)
+                    // artifactinfo.retention maxBuilds: 20, deleteBuildArtifacts: true
+                    artifactinfo.name = "${app_family}-${app_name}"
+                    artifactory_server.publishBuildInfo(artifactinfo)
+
+                    //sh("echo {\"build_version\" : \"${full_version}\"} >> application/build.json")
+                }
+            }
+        }
+
+        stage('Save JSON') {
+            steps {
+                script {
+                    dir("application"){
+                        def data = "{\"version\":\"${full_version}\"}"
+                        def json = readJSON text: data
+                        writeJSON(file: 'output.json', json: json)
+                    }
+                }
+            }
+           
+        }
+
+        // run deploy build
+        stage("Deploy") {
+            steps {
+                script {
+                    if(params.build_only == false) {
+                        // build job: '../deploy/' + env.GIT_BRANCH, parameters: [
+                        // use JOB_BASE_NAME as it will have urlencoding whereas GIT_BRANCH can have slashes
+                        build job: '../deploy/' + env.JOB_BASE_NAME, parameters: [
+                            string(name: 'version', value: full_version),
+                            string(name: 'environment', value: deploy_target),
+                            string(name: 'region', value: region),
+                        ]
+                    }
+                }
+            }
+        }
+
+        
+
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'application/output.json', onlyIfSuccessful: true
+            sh(script: "chmod -R a+rw ${env.WORKSPACE}")
+            addShortText(full_version)
+            cleanWs()
+        }
+        // success {
+        //     emailext (
+        //         to: jenkins_status_email,
+        //         subject: "SUCCESSFUL: Jenkings Job ${app_family} ${app_name} [${env.BUILD_NUMBER}]",
+        //         body: """<p>SUCCESSFUL:</p><p>Jenkings Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]</p>
+        //                 <p>Src: ${env.GIT_URL} [${env.GIT_COMMIT}]</p>
+        //             <p>Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>&QUOT;</p>""",
+        //         recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+        //     )
+        // }
+
+        failure {
+            emailext (
+                to: jenkins_status_email,
+                subject: "FAILED: Jenkings Job ${app_family} ${app_name} [${env.BUILD_NUMBER}]",
+                body: """<p>FAILED:</p><p>Jenkings Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]</p>
+                        <p>Src: ${env.GIT_URL} [${env.GIT_COMMIT}]</p>
+                    <p>Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>&QUOT;</p>""",
+                    recipientProviders: [[$class: 'FailingTestSuspectsRecipientProvider']]
+                // see reciepients at
+                // https://github.com/jenkinsci/email-ext-plugin/tree/master/src/main/java/hudson/plugins/emailext/plugins/recipients
+                // https://jenkins.io/doc/pipeline/steps/email-ext/
+            )
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+pipeline {
+    agent {
+        label 'docker'
+    }
+
+    environment {
+        AWS_SHARED_CREDENTIALS_FILE = "${env.WORKSPACE}/awsconfig"
+        AWS_DEFAULT_REGION  = "us-west-2"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20', daysToKeepStr: '90'))
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    parameters {
+        string (name: 'version', description: 'Artifact Version')
+        choice (name: 'environment', choices: ["dev"], description: 'Deployment Environment')
+        string (name: 'region', defaultValue: 'us-west-2', description: 'AWS Region')
+    }
+
+    stages {
+
+        stage('Setup Workspace') {
+            steps {
+                cleanWs()
+                script {
+                   // make sure params are populated in jenkins (first run always fails)
+                    if(params.environment == null || params.environment.length() == 0) {
+                        println("ERROR: environment param is empty ")
+                        sh("exit 1")
+                    }
+                    // insure PROD and UAT deployment only works from master branch
+                    if(params.environment == 'uat' || params.environment == 'prod') {
+                        if(env.GIT_BRANCH != 'master') {
+                            println("ERROR: Deployment to uat or prod can only be run from master branch")
+                            sh("exit 1")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Checkout") {
+            steps {
+                dir("application") {
+                    git(url: env.GIT_URL, branch: env.GIT_BRANCH, credentialsId: "git-techm-io-tk")
+                    script {
+                        git_commit = sh(script: "git rev-parse HEAD", returnStdout: true).trim()
+                    }
+                }
+                
+
+                dir("buildtools") {
+                    git(url: 'https://git.techm.io/scm/ccdev/cc-devops-buildtools.git', branch: "master", credentialsId: "git-techm-io-tk")
+                }
+            }
+        }
+
+        // read all properties from top level setting file
+        stage("Setup Project Properties") {
+            steps {
+                script {
+                   
+                    // yml settings files
+                    project_setting_file = "${WORKSPACE}/application/project_setting.yml"
+                    build_settings_file ="${WORKSPACE}/application/build_setting.yml"
+                    sh("${env.WORKSPACE}/buildtools/tools/create_build_setting.py -f ${project_setting_file} -e ${environment} -r ${region} -b ${GIT_BRANCH} ")
+                    sh("cat ${build_settings_file}")
+                    def props = readYaml file: build_settings_file
+                    app_name = props.config.app_name
+                    app_family = props.config.app_family
+                    account_name = props.config.account_name
+                    rpm_deploy_server = props.config.rpm_deploy_server
+                    jenkins_status_email = props.config.jenkins_status_email
+                    println("""
+                        app_name = ${app_name}
+                        app_family = ${app_family}
+                        account_name = ${account_name}
+                    """)
+
+                    terraform_version = props.config.terraform_version
+
+                }
+            }
+        }
+
+        // set up aws evironment using local cred file
+        stage("Assume AWS Role") {
+            steps {
+                script {
+                    deploy_role_cred_id = account_name + '-deploy-role'
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: deploy_role_cred_id, usernameVariable: 'JUNK', passwordVariable: 'AWS_ASSUME_ROLE']]) {
+                        profile_name = 'build_deploy'
+                        sh("${env.WORKSPACE}/buildtools/tools/assume_role.py --role ${AWS_ASSUME_ROLE} --session ${profile_name} --file ${AWS_SHARED_CREDENTIALS_FILE}")
+                        sh("aws --profile ${profile_name} sts get-caller-identity")
+                    }
+                }
+            }
+        }
+
+        
+
+        // Update RDS
+        stage("Update Instance") {
+            steps {
+                script {
+                    
+                    instance_id = sh(script: "aws ec2 describe-instances --region ${region} --profile ${profile_name} --filters \"Name=tag:Name,Values=${app_family}-${rpm_deploy_server}-${environment}\"  \"Name=instance-state-name,Values=running\"  --query 'Reservations[*].Instances[*].InstanceId' --output text", returnStdout: true).trim()
+                    print("${rpm_deploy_server} Instance IDs: ${instance_id}")
+
+                    
+                    if (instance_id != ""){
+                        String[] instanceIdsArray = instance_id.split('\n');
+
+                        String instanceIdsStr = ""
+                        for (instance_id in instanceIdsArray) {
+                            instanceIdsStr += "\"" + instance_id.toString() + "\","
+                        }
+                        //Removed final comma
+                        instanceIdsStr = instanceIdsStr.substring(0, instanceIdsStr.length()-1)
+                        println ("Instance Ids Str : ${instanceIdsStr}")
+                        commandId = sh(script: "aws ssm send-command --document-name \"${app_family}-common-${environment}-rpm-update\" --document-version '\$DEFAULT' --targets \'[{\"Key\":\"InstanceIds\",\"Values\":[${instanceIdsStr}]}]\' --parameters '{\"artHost\":[\"https://repo-int.techm.io/artifactory\"],\"artRepo\":[\"cc-rpm-local\"],\"appFamily\":[\"${app_family}\"],\"appName\":[\"${app_name}\"],\"rpmVersion\":[\"${version}\"],  \"tailorCommand\":[\"/opt/techm/chemcur/chemworkbench/config/tailor_rpm_env.sh ${region} ${app_family} ${environment}\"] }' --timeout-seconds 600 --max-concurrency \"50\" --max-errors \"0\" --region ${region} --profile ${profile_name} --query 'Command.CommandId' --output text", returnStdout: true).trim()
+                        print ("command ID : ${commandId}")
+                        for (int i = 1; i <= 10; i++) {
+                            for (instance_id in instanceIdsArray) {
+
+                                commandStatus=sh(script: "aws ssm get-command-invocation --command-id \"${commandId}\" --instance-id \"${instance_id}\" --region ${region} --profile ${profile_name} --query 'Status' --output text", returnStdout: true).trim()
+                                if (commandStatus == 'Success') {
+                                    print ("SSM Run Command execution completed successully for ${instance_id}")
+                                    commandStatus=sh(script: "aws ssm get-command-invocation --command-id \"${commandId}\" --instance-id \"${instance_id}\" --region ${region} --profile ${profile_name} ", returnStdout: true)
+                                    println("Command Status Output : \n ${commandStatus}")
+                                    i = 11
+                                }else {
+                                    if (commandStatus == "InProgress"){
+                                        print ("SSM Run Command execution completed In Progress for ${instance_id}..Re-verifying the status ${i} times out of 10")
+                                    }else {
+                                        
+                                        print ("SSM Run Command execution status : ${commandStatus} for ${instance_id}..Re-verifying the status ${i} times out of 10")
+                                        if (i == 10) {
+                                            commandStatus=sh(script: "aws ssm get-command-invocation --command-id \"${commandId}\" --instance-id \"${instance_id}\" --region ${region} --profile ${profile_name} ", returnStdout: true)
+                                            println("Command Status Output : \n ${commandStatus}")
+                                        }
+                                    }
+                                }
+                                sleep(time:3,unit:"SECONDS")
+                            }
+                        }
+                    }else {
+                        print ("Not instance matching the Name : ${app_family}-${rpm_deploy_server}-${environment}. Skipping SSM Run Command")
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        always {
+            sh(script: "chmod -R a+rw ${env.WORKSPACE}")
+            addShortText(version)
+            addShortText(environment)
+            cleanWs()
+        }
+        // success {
+        //     emailext (
+        //         to: jenkins_status_email,
+        //         subject: "SUCCESSFUL: Jenkings Job ${app_family} ${app_name} [${env.BUILD_NUMBER}]",
+        //         body: """<p>SUCCESSFUL:</p><p>Jenkings Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]</p>
+        //                 <p>Src: ${env.GIT_URL} [${env.GIT_COMMIT}]</p>
+        //             <p>Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>&QUOT;</p>""",
+        //         recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+        //     )
+        // }
+
+        failure {
+            emailext (
+                to: jenkins_status_email,
+                subject: "FAILED: Jenkings Job ${app_family} ${app_name} [${env.BUILD_NUMBER}]",
+                body: """<p>FAILED:</p><p>Jenkings Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]</p>
+                        <p>Src: ${env.GIT_URL} [${env.GIT_COMMIT}]</p>
+                    <p>Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>&QUOT;</p>""",
+                    recipientProviders: [[$class: 'FailingTestSuspectsRecipientProvider']]
+                // see reciepients at
+                // https://github.com/jenkinsci/email-ext-plugin/tree/master/src/main/java/hudson/plugins/emailext/plugins/recipients
+                // https://jenkins.io/doc/pipeline/steps/email-ext/
+            )
+        }
+    }
+}
