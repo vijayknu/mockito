@@ -1,10 +1,12 @@
 pipeline {
-    agent any
-    stages {
-        stage('build') {
-            steps {
-                bat 'mvn --version'
-            }
-        }
-    }
+	agent any	
+	stages {		
+		stage('Build') {		
+			steps{
+				retry(3){
+					bat 'mvn --version'
+				}
+			}
+		}		
+	}
 }
