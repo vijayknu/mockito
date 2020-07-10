@@ -7,7 +7,7 @@ public class TodoServiceStub implements TodoService {
 
 	public List<String> findTodos(String user) {
 
-		return Arrays.asList("Learn Spring MVC","","Learn Java", "Learn Spring Boot");
+		return Arrays.asList("Learn Spring MVC Test","","Learn Java", "Learn Spring Boot");
 	}
 
 	public void deleteTodos(String todo) {
